@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>Gocambridge (Web)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 1rem; background:#0b0b0f; color:#e5e7eb; }
+    h1 { font-size: 1.2rem; margin-bottom: 0.5rem; }
+    label { display:block; margin-top:0.75rem; font-size:0.85rem; color:#9ca3af; }
+    input, select { width:100%; box-sizing:border-box; padding:0.45rem 0.6rem; border-radius:6px; border:1px solid #374151; background:#111827; color:#e5e7eb; font-size:0.85rem; }
+    button { margin-top:0.9rem; padding:0.6rem 1.2rem; border-radius:999px; border:none; background:#3b82f6; color:white; font-weight:600; font-size:0.9rem; }
+    button:disabled { opacity:0.5; }
+    table { width:100%; border-collapse:collapse; margin-top:1rem; font-size:0.85rem; }
+    th, td { border:1px solid #374151; padding:0.4rem 0.5rem; }
+    th { background:#111827; }
+    pre { white-space:pre-wrap; word-break:break-word; background:#020617; border-radius:6px; border:1px solid #1f2937; padding:0.6rem; margin-top:0.5rem; font-size:0.8rem; }
+    .row { display:flex; gap:0.75rem; margin-top:0.75rem; flex-wrap:wrap; }
+    .row > div { flex:1 1 150px; min-width:0; }
+    .status { font-size:0.8rem; color:#9ca3af; margin-top:0.4rem; }
+  </style>
+</head>
+<body>
+  <h1>Gocambridge (Web)</h1>
+  <p style="font-size:0.85rem;color:#9ca3af;">
+    Entspricht der CLI <code>cambridge-go -c COOKIE -u URL</code>, aber als Web‑UI.
+  </p>
+
+  <label for="cookie">Cookie (c1_sid)</label>
+  <input id="cookie" placeholder="s%3AFKu-****">
+
+  <label for="url">Cambridge One URL</label>
+  <input id="url" placeholder="https://www.cambridgeone.org/nlp/apigateway/org_.../product/.../class/...">
+
+  <button id="startBtn">Start</button>
+  <div class="status" id="status"></div>
+
+  <div class="row">
+    <div>
+      <label for="unitSelect">Select Unit</label>
+      <select id="unitSelect" disabled></select>
+    </div>
+    <div>
+      <label for="sectionSelect">Select Section</label>
+      <select id="sectionSelect" disabled></select>
+    </div>
+    <div>
+      <label for="lessonSelect">Select Lesson</label>
+      <select id="lessonSelect" disabled></select>
+    </div>
+  </div>
+
+  <table id="answersTable" style="display:none;">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>Correct Answer</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <pre id="errorBox" style="display:none;"></pre>
+
+  <script type="module">
+    import { Cambridge } from "./cambridge.js";
+
+    // --- CLI-Konstanten (aus internal/cli/consts.go) ---
+    const UrlRegex = /([^/]+)\\/class\\/([^/]+)\\/product\\/([^/]+)/;
+    const SelectLimit = 10; // hier nur dokumentarisch
+    const CorrectAnswersLabel = "Correct Answer";
+    const CorrectAnswersSymbol = "#";
+
+    const BackKey = "b";
+    const InitialKey = "i";
+    const ExitKey = "e";
+
+    // --- DOM-Elemente ---
+    const cookieInput = document.getElementById("cookie");
+    const urlInput = document.getElementById("url");
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+
+    const unitSelect = document.getElementById("unitSelect");
+    const sectionSelect = document.getElementById("sectionSelect");
+    const lessonSelect = document.getElementById("lessonSelect");
+
+    const answersTable = document.getElementById("answersTable");
+    const answersTbody = answersTable.querySelector("tbody");
+    const errorBox = document.getElementById("errorBox");
+
+    let cambridgeClient = null;
+    let unitsResult = null;
+    let currentOrg = "";
+    let currentProduct = "";
+    let currentClass = "";
+
+    // --- Hilfsfunktionen für UI ---
+
+    function setStatus(msg) {
+      statusEl.textContent = msg || "";
+    }
+
+    function showError(err) {
+      errorBox.style.display = "block";
+      errorBox.textContent = String(err);
+    }
+
+    function clearError() {
+      errorBox.style.display = "none";
+      errorBox.textContent = "";
+    }
+
+    function fillSelect(selectEl, items, includeExit) {
+      selectEl.innerHTML = "";
+      const opts = [...items];
+      const returnIndex = opts.length;
+      opts.push(includeExit ? "Exit" : "Go back");
+
+      opts.forEach((label, idx) => {
+        const opt = document.createElement("option");
+        opt.value = String(idx);
+        opt.textContent = label;
+        selectEl.appendChild(opt);
+      });
+
+      selectEl.disabled = false;
+      return returnIndex;
+    }
+
+    function parseUrl(url) {
+      const m = UrlRegex.exec(url);
+      if (!m) {
+        throw new Error("invalid URL");
+      }
+      // UrlRegex: `([^/]+)/class/([^/]+)/product/([^/]+)`
+      const org = m[1];
+      const classId = m[2];
+      const product = m[3];
+      return { org, classId, product };
+    }
+
+    // --- Hauptfluss (Port von cli.Run + tui.go) ---
+
+    async function startFlow() {
+      clearError();
+      setStatus("");
+
+      const cookie = cookieInput.value.trim();
+      const url = urlInput.value.trim();
+
+      if (!cookie || !url) {
+        setStatus("Bitte Cookie und URL angeben.");
+        return;
+      }
+
+      let parsed;
+      try {
+        parsed = parseUrl(url);
+      } catch (e) {
+        showError(e);
+        setStatus("Ungültige URL.");
+        return;
+      }
+
+      currentOrg = parsed.org;
+      currentProduct = parsed.product;
+      currentClass = parsed.classId;
+
+      cambridgeClient = new Cambridge(currentOrg, currentProduct, cookie);
+
+      try {
+        setStatus("Lade Units...");
+        unitsResult = await cambridgeClient.getUnits(currentClass);
+        setStatus("Units geladen.");
+      } catch (e) {
+        showError(e);
+        setStatus("Fehler beim Laden der Units.");
+        return;
+      }
+
+      setupUnitSelection();
+    }
+
+    function setupUnitSelection() {
+      answersTable.style.display = "none";
+      answersTbody.innerHTML = "";
+
+      const units = unitsResult.toc.result.map(r => r.name);
+      const returnIndex = fillSelect(unitSelect, units, true);
+
+      sectionSelect.innerHTML = "";
+      sectionSelect.disabled = true;
+      lessonSelect.innerHTML = "";
+      lessonSelect.disabled = true;
+
+      unitSelect.onchange = () => {
+        const idx = parseInt(unitSelect.value, 10);
+        if (idx === returnIndex) {
+          // Exit
+          setStatus("Bye!");
+          unitSelect.disabled = true;
+          sectionSelect.disabled = true;
+          lessonSelect.disabled = true;
+          return;
+        }
+        setupSectionSelection(idx);
+      };
+    }
+
+    function setupSectionSelection(unitIndex) {
+      answersTable.style.display = "none";
+      answersTbody.innerHTML = "";
+
+      const sections = unitsResult.toc.result[unitIndex].items.map(r => r.name);
+      const returnIndex = fillSelect(sectionSelect, sections, false);
+
+      lessonSelect.innerHTML = "";
+      lessonSelect.disabled = true;
+
+      sectionSelect.onchange = () => {
+        const idx = parseInt(sectionSelect.value, 10);
+        if (idx === returnIndex) {
+          // Go back to units
+          setupUnitSelection();
+          return;
+        }
+        setupLessonSelection(unitIndex, idx);
+      };
+    }
+
+    function setupLessonSelection(unitIndex, sectionIndex) {
+      answersTable.style.display = "none";
+      answersTbody.innerHTML = "";
+
+      const lessons = unitsResult.toc.result[unitIndex].items[sectionIndex].items.map(r => r.name);
+      const returnIndex = fillSelect(lessonSelect, lessons, false);
+
+      lessonSelect.onchange = async () => {
+        const idx = parseInt(lessonSelect.value, 10);
+        if (idx === returnIndex) {
+          // Go back to sections
+          setupSectionSelection(unitIndex);
+          return;
+        }
+        await showSolution(unitIndex, sectionIndex, idx);
+      };
+    }
+
+    async function showSolution(unitIndex, sectionIndex, lessonIndex) {
+      clearError();
+      setStatus("Lade Lösungen...");
+
+      const item = unitsResult.toc.result[unitIndex].items[sectionIndex].items[lessonIndex];
+      const itemCode = item["item-code"];
+      const parts = itemCode.split("/");
+      const lessonCode = parts[parts.length - 1];
+
+      let solution;
+      try {
+        solution = await cambridgeClient.getLessonResponse(currentProduct, lessonCode);
+      } catch (e) {
+        showError(e);
+        setStatus("Fehler beim Laden der Lösungen.");
+        return;
+      }
+
+      answersTbody.innerHTML = "";
+      solution.forEach((res, idx) => {
+        const tr = document.createElement("tr");
+        const tdIdx = document.createElement("td");
+        const tdAns = document.createElement("td");
+        tdIdx.textContent = String(idx + 1);
+        tdAns.textContent = res;
+        tr.appendChild(tdIdx);
+        tr.appendChild(tdAns);
+        answersTbody.appendChild(tr);
+      });
+
+      answersTable.style.display = "table";
+      setStatus("Lösungen geladen.");
+    }
+
+    // --- Init ---
+    startBtn.addEventListener("click", () => {
+      startFlow().catch(showError);
+    });
+  </script>
+</body>
+</html>
